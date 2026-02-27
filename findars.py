@@ -35,7 +35,7 @@ input_data_dir = '{}input_data/'.format(ar_dir)
 
 testing = 0 #toggle for troubleshooting
 if testing:
-    years = [1990] 
+    years = [2000] 
     months = [1,2,3,4,5,6,7,8,9,10,11,12]
 else:
     years = list(range(1981, 2020))
@@ -49,16 +49,14 @@ min_span = 1000
 min_size = 35
 
 ## filter toggles
-use_filter_landfall = 0
 use_filter_size = 1
 use_filter_length = 1
 use_filter_narrowness = 1
 use_filter_meridional_ivt = 1
 use_filter_ivt_coherence = 1
 use_filter_orientation = 1
-use_filter_longitude = 0
+use_filter_longitude = 1
 use_filter_latitude = 1
-use_filter_origin = 1  # backwards trajectory / ocean-origin filter
 
 static_threshold = 1
 threshold = 500
@@ -68,6 +66,14 @@ include_ar_snapshot = 1
 include_ar_nc_masks = 1
 include_ar_char_csv = 1
 include_filtering_data = 1
+
+# --- daily aggregation (for lag/teleconnection work) ---
+# If True, aggregate 6-hourly IVT into daily fields before AR detection.
+# daily_method: 'sum' (recommended for daily-integrated transport) or 'mean'.
+aggregate_daily = 0
+daily_method = 'mean'
+# If True, also write a daily summary CSV in addition to per-object rows.
+include_daily_summary_csv = 1
 
 ## input data info
 res = 1.5 #resolution
@@ -79,20 +85,6 @@ max_lon = 270.0
 lat_grid_number = 48
 lon_grid_number = 61
 
-## load land mask
-land_mask_dir = f'{ar_dir}landmask_global.nc'
-land_mask = iris.load(land_mask_dir)[0][0]
-# rename coordinates for consistency
-if 'lon' in [c.name() for c in land_mask.coords()]:
-    land_mask.coord('lon').rename('longitude')
-if 'lat' in [c.name() for c in land_mask.coords()]:
-    land_mask.coord('lat').rename('latitude')
-# extract to numpy array for flexible shape ops
-lm = land_mask.data
-if lm.ndim == 1:
-    lm = np.tile(lm, (lat_grid_number, 1))  # replicate across latitude
-land_mask_data = lm  # use this instead of land_mask.data later
-
 ### DIRECTORY CREATION & CLEANUP
 
 if not os.path.exists('{}ivt_thresholds'.format(ar_dir)):
@@ -103,26 +95,42 @@ if not os.path.exists('{}ar_masks'.format(ar_dir)):
     os.makedirs('ar_masks') # Contains AR shape .nc masks
 if not os.path.exists('{}ar_axes'.format(ar_dir)):
     os.makedirs('ar_axes') # Contains AR axes .nc masks
-if not os.path.exists('{}landfall_locations'.format(ar_dir)):
-    os.makedirs('landfall_locations') # Contains max IVT cell .nc masks
 if not os.path.exists('{}ar_characteristics'.format(ar_dir)):
     os.makedirs('ar_characteristics') # Contains AR characteristics csv file
 with open('{}ar_characteristics/ar_characteristics.csv'.format(ar_dir), 'a', newline='') as f:
     thewriter = csv.writer(f)
-    thewriter.writerow(['year', 'month', 'day', 'time', 'label', 'length', 'width',
-                        'mean_ivt', 'mean_ivt_direction', 'landfall_ivt', 'landfall_ivt_direction',
-                        'surface_area', 'mean_latitude', 'min_latitude', 'max_latitude'])
+    thewriter.writerow([
+    'year', 'month', 'day', 'time', 'label',
+    'length_km', 'width_km',
+    'mean_ivt', 'max_ivt',
+    'mean_ivt_direction',
+    'traj_bearing_deg',
+    'surface_area_km2',
+    'mean_latitude', 'min_latitude', 'max_latitude'
+])
 if not os.path.exists('{}filtering_data'.format(ar_dir)):
     os.makedirs('filtering_data') # Contains AR algorithm filtering csv
 with open('{}filtering_data/filtering_data.csv'.format(ar_dir), 'a', newline='') as f:
     thewriter = csv.writer(f)
-    thewriter.writerow(['year','month', 'initial','num_ob_landfall','num_ob_size','num_ob_lat','num_ob_long',
-                        'num_ob_length','num_ob_narrowness', 'num_ob_max','num_ob_mean',
-                        'num_ob_poleward_ivt','num_ob_ivt_coherence',
-                        'num_ob_orientation'])
-    
+    thewriter.writerow(['year','month','initial','post_size','post_lat','post_longitude','post_length',
+                        'post_narrowness','post_meridional_ivt','post_ivt_coherence',
+                        'post_orientation'])
+
+# Daily summary CSV (optional): counts + mean intensity/bearing for each day
+if include_daily_summary_csv:
+    if not os.path.exists(f'{ar_dir}daily_summary'):
+        os.makedirs(f'{ar_dir}daily_summary')
+    daily_summary_path = f'{ar_dir}daily_summary/daily_summary.csv'
+    with open(daily_summary_path, 'w', newline='') as f:
+        csv.writer(f).writerow([
+            'year','month','day',
+            'n_ar',
+            'mean_mean_ivt','mean_max_ivt',
+            'mean_traj_bearing'
+        ])
+
 import glob
-for folder in ['ivt_thresholds', 'ar_snapshots', 'ar_masks', 'ar_axes', 'landfall_locations']:
+for folder in ['ivt_thresholds', 'ar_snapshots', 'ar_masks', 'ar_axes']:
     for f in glob.glob(f'{ar_dir}{folder}/*'):
         os.remove(f)
 
@@ -131,7 +139,7 @@ for folder in ['ivt_thresholds', 'ar_snapshots', 'ar_masks', 'ar_axes', 'landfal
 def make_base_map():
     """set up a pacific-centered map projection and return an axis."""
     ax = plt.axes(projection=ccrs.PlateCarree(central_longitude=180))
-    ax.set_extent([120, 270, 0, 80], crs=ccrs.PlateCarree())
+    ax.set_extent([min_lon, max_lon, 0, 80], crs=ccrs.PlateCarree())
 
     gl = ax.gridlines(draw_labels=True, linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
     gl.top_labels = False
@@ -148,17 +156,16 @@ def make_base_map():
 
 def compute_valid_ids(i):
     """return list of surviving AR indices at timestep i after all filters."""
-    all_filters = set(landfall_filter[i] + size_filter[i] + lat_filter[i] +
+    all_filters = set(size_filter[i] + lat_filter[i] + lon_filter[i] +
                       filter_list_1[i] + filter_list_2[i] + filter_list_3[i] + 
-                      filter_list_4[i] + filter_list_5[i] + filter_list_6[i])
+                      filter_list_4[i] + filter_list_5[i])
     return [j for j in range(num_ob_list[i]) if (j + 1) not in all_filters]
 
 def plot_snapshot(
-    i, ar_dir, num_ob_list, landfall_filter, size_filter, lat_filter,
+    i, ar_dir, num_ob_list, size_filter, lat_filter,
     filter_list_1, filter_list_2, filter_list_3, filter_list_4, filter_list_5,
-    ivt, zero, labelled_object_list, axis_list, eastward_ivt, northward_ivt,
-    axis_length_list, object_width_list, mean_ivt_magnitude_list, mean_ivt_direction_list,
-    landfall_ivt_magnitudes, landfall_ivt_directions
+    ivt_frames, zero, labelled_object_list, axis_list, eastward_ivt_frames, northward_ivt_frames,
+    axis_length_list, object_width_list, mean_ivt_magnitude_list, mean_ivt_direction_list
 ):
     """
     plot and save snapshots of atmospheric rivers for timestep i with fixed pacific-centered view.
@@ -166,7 +173,8 @@ def plot_snapshot(
     valid_ids = compute_valid_ids(i)
 
     # extract time info
-    time_coord = ivt[i].coord('time')
+    frame = ivt_frames[i]
+    time_coord = frame.coord('time')
     time_point = time_coord.units.num2date(time_coord.points[0])
     date_text = time_point.strftime('%Y-%m-%d')
     time_text = time_point.strftime('%H')
@@ -217,12 +225,12 @@ def plot_snapshot(
                     linewidth=0.5)
     # Plot IVT contours (background)
     ivt_contour = (iris.plot.contourf(
-        ivt[i], levels=np.linspace(250,1500,11),
+        frame, levels=np.linspace(250,1500,11),
         cmap=matplotlib.cm.get_cmap('Blues'),
         zorder=0, extend='max'))
     # Plot IVT vectors
-    uwind = eastward_ivt[i]
-    vwind = northward_ivt[i]
+    uwind = eastward_ivt_frames[i]
+    vwind = northward_ivt_frames[i]
     ulon = uwind.coord('longitude')
     vlon = vwind.coord('longitude')
     x = ulon.points
@@ -275,9 +283,9 @@ def plot_snapshot(
     plt.savefig('{}ar_snapshots/ar_{}-{}_composite.png'.format(ar_dir, date_text, time_text), dpi=700)
     plt.close("all")
 
-def save_nc_masks(i, valid_ids):
-    """save .nc masks, axes, and landfall for valid ARs."""
-    time_coord = ivt[i].coord('time')
+def save_nc_masks(i, valid_ids, ivt_frames):
+    """save .nc masks and axes for valid ARs."""
+    time_coord = ivt_frames[i].coord('time')
     time_point = time_coord.units.num2date(time_coord.points[0])
     date_text = time_point.strftime('%Y-%m-%d')
     time_text = time_point.strftime('%H')
@@ -285,12 +293,13 @@ def save_nc_masks(i, valid_ids):
         mask = labelled_object_list[i].copy()
         mask.data = np.where(mask.data == j + 1, 1, 0)
         iris.save(mask, f'{ar_dir}ar_masks/ar_{date_text}-{time_text}_mask_{count}.nc')
-        iris.save(axis_list[i], f'{ar_dir}ar_axes/ar_{date_text}-{time_text}_axes_{count}.nc')
-        iris.save(landfall_locations[i], f'{ar_dir}landfall_locations/ar_{date_text}-{time_text}_landfall_{count}.nc')
+        axis_mask = axis_list[i].copy()
+        axis_mask.data = np.where(axis_mask.data == j + 1, 1, 0)
+        iris.save(axis_mask, f'{ar_dir}ar_axes/ar_{date_text}-{time_text}_axes_{count}.nc')
 
-def save_ar_csv(i, valid_ids):
+def save_ar_csv(i, valid_ids, ivt_frames):
     """append AR characteristic rows to master csv."""
-    time_coord = ivt[i].coord('time')
+    time_coord = ivt_frames[i].coord('time')
     time_point = time_coord.units.num2date(time_coord.points[0])
     date_text = time_point.strftime('%Y-%m-%d')
     time_text = time_point.strftime('%H')
@@ -298,157 +307,161 @@ def save_ar_csv(i, valid_ids):
     time_str = time_text
 
     for count, j in enumerate(valid_ids, start=1):
-        length = str(round(axis_length_list[i][j], -1))[:-2]
-        width = str(round(object_width_list[i][j], -1))[:-2]
-        mean_ivt = str(round(mean_ivt_magnitude_list[i][j], 0))[:-2]
-        mean_ivt_dir = str(round(mean_ivt_direction_list[i][j], 1))[:-2]
-        landfall_ivt = str(round(landfall_ivt_magnitudes[i][j], 0))[:-2]
-        landfall_dir = str(round(landfall_ivt_directions[i][j], 1))[:-2]
-        surface_area = str(round(object_area_list[i][j], 1))
+        length = float(axis_length_list[i][j])
+        width = float(object_width_list[i][j])
+        mean_ivt = float(mean_ivt_magnitude_list[i][j])
+        max_ivt = float(max_ivt_list[i][j]) if (i < len(max_ivt_list) and j < len(max_ivt_list[i])) else np.nan
+        mean_ivt_dir = float(mean_ivt_direction_list[i][j])
+
+        traj_bearing = float(traj_bearing_list[i][j]) if (i < len(traj_bearing_list) and j < len(traj_bearing_list[i])) else np.nan
+
+        surface_area = float(object_area_list[i][j])
 
         blob_mask = (labelled_object_list[i].data == (j+1))
-        lat_points = northward_ivt.coord('latitude').points
+        lat_points = northward_ivt_list[i].coord('latitude').points
         blob_latitudes = lat_points[np.where(np.any(blob_mask, axis=1))]
-        mean_lat = str(round(blob_latitudes.mean(), 2))
-        min_lat = str(round(blob_latitudes.min(), 2))
-        max_lat = str(round(blob_latitudes.max(), 2))
+        mean_latv = float(np.nanmean(blob_latitudes)) if blob_latitudes.size else np.nan
+        min_latv = float(np.nanmin(blob_latitudes)) if blob_latitudes.size else np.nan
+        max_latv = float(np.nanmax(blob_latitudes)) if blob_latitudes.size else np.nan
 
-        row = [year_str, month_str, day, time_str, count, length, width,
-            mean_ivt, mean_ivt_dir, landfall_ivt, landfall_dir,
-            surface_area, mean_lat, min_lat, max_lat]
+        row = [
+            year_str, month_str, day, time_str, count,
+            length, width,
+            mean_ivt, max_ivt,
+            mean_ivt_dir,
+            traj_bearing,
+            surface_area,
+            mean_latv, min_latv, max_latv
+        ]
 
         with open(f'{ar_dir}ar_characteristics/ar_characteristics.csv', 'a', newline='') as f:
             csv.writer(f).writerow(row)
 
 def save_filter_stats():
     """summarize filtering numbers for current month."""
-    num_landfall = [len(x) for x in landfall_filter]
     num_size = [len(x) for x in size_filter]
     num_lat = [len(x) for x in lat_filter]
-
+    num_long = [len(x) for x in lon_filter]
     num1 = [len(x) for x in filter_list_1]
     num2 = [len(x) for x in filter_list_2]
-
     num3 = [len(x) for x in filter_list_3]
     num4 = [len(x) for x in filter_list_4]
     num5 = [len(x) for x in filter_list_5]
 
-    numbt = [len(x) for x in filter_list_6]
-
-    num_ob_0 = np.sum(num_ob_list)
-    num_ob_land = num_ob_0 - np.sum(num_landfall)
-    num_ob_size = num_ob_land - np.sum(num_size)
-    num_ob_lat = num_ob_size - np.sum(num_lat)
-
-    num_ob_2 = num_ob_lat - np.sum(num1)
-    num_ob_3 = num_ob_2 - np.sum(num2)
-    num_ob_4 = num_ob_3 - np.sum(num3)
-    num_ob_5 = num_ob_4 - np.sum(num4)
-    num_ob_6 = num_ob_5 - np.sum(num5)
-    num_ob_bt = num_ob_6 - np.sum(numbt)
+    num_initial = np.sum(num_ob_list)
+    post_size = num_initial - np.sum(num_size)
+    post_lat = post_size - np.sum(num_lat)
+    post_long = post_lat - np.sum(num_long)
+    post_length = post_long - np.sum(num1)
+    post_narrowness = post_length - np.sum(num2)
+    post_meridional = post_narrowness - np.sum(num3)
+    post_coherence = post_meridional - np.sum(num4)
+    post_orientation = post_coherence - np.sum(num5)
 
     with open(f'{ar_dir}filtering_data/filtering_data.csv', 'a', newline='') as f:
-        csv.writer(f).writerow([year, month, num_ob_0, num_ob_land,
-                                num_ob_size, num_ob_lat, num_ob_2, num_ob_3, 
-                                num_ob_4, num_ob_5, num_ob_6, num_ob_bt])
+        csv.writer(f).writerow([year, month, num_initial, post_size, post_lat, post_long,
+                                post_length, post_narrowness, post_meridional,
+                                post_coherence, post_orientation])
 
-def compute_ar_axes(ivt, zero, labelled_object_list, ivt_list, ivt_direction_list, num_ob_list, size_filter, landfall_filter):
-    """
-    Compute AR axes, landfall locations, IVT magnitudes/directions, and shape classification for each AR object.
-    Returns:
-        (axis_list, axis_coords_list, landfall_locations, landfall_ivt_magnitudes, landfall_ivt_directions, shape_classification_list)
-    """
+def compute_ar_axes(ivt, zero, labelled_object_list, ivt_list, ivt_direction_list, num_ob_list,
+                    size_filter, northward_ivt_list, eastward_ivt_list):
+    """Compute AR axes and trajectory bearing for each object."""
     from skimage.morphology import skeletonize
-    from skimage.graph import route_through_array
-    import numpy as np
-    def classify_blob_shape(blob_mask, filtered_blob_mask):
-        # Classify the AR blob as 'zonal', 'meridional', 'recurve', or 'ambiguous'
-        rows, cols = np.where(blob_mask)
-        if len(rows) == 0:
-            return 'ambiguous'
-        lat_span = rows.max() - rows.min()
-        lon_span = cols.max() - cols.min()
-        if lat_span == 0 or lon_span == 0:
-            return 'ambiguous'
-        aspect = lon_span / lat_span if lat_span > 0 else np.inf
-        if aspect > 2:
-            return 'zonal'
-        elif aspect < 0.5:
-            return 'meridional'
-        # For recurve: check if both spans are large enough and the blob is "curved"
-        if lat_span > 10 and lon_span > 10:
-            # crude check: if the skeleton's endpoints are not at the bounding box corners
-            skel = skeletonize(filtered_blob_mask.astype(np.uint8))
-            coords = np.argwhere(skel)
-            if coords.shape[0] >= 2:
-                end1 = coords[0]
-                end2 = coords[-1]
-                bbox_corners = np.array([[rows.min(), cols.min()], [rows.max(), cols.max()]])
-                if not (np.allclose(end1, bbox_corners[0]) or np.allclose(end2, bbox_corners[1])):
-                    return 'recurve'
-        return 'ambiguous'
 
     axis_list = []
     axis_coords_list = []
-    landfall_locations = []
-    landfall_ivt_magnitudes = []
-    landfall_ivt_directions = []
-    shape_classification_list = []
+    traj_bearing_list = []
+    max_ivt_list = []
+
     template = zero.data
     n_timesteps = len(ivt_list)
+
+    lats = northward_ivt_list[0].coord('latitude').points
+    lons = _to_0_360(northward_ivt_list[0].coord('longitude').points)
+
     for i in range(n_timesteps):
         axis_data = np.zeros_like(template, dtype=np.int32)
-        landfall_data = np.zeros_like(template, dtype=np.int32)
         step_coords_list = []
-        step_landfall_ivt_mags = []
-        step_landfall_ivt_dirs = []
-        step_shape_class = []
+        step_traj_bearing = []
+        step_max_ivt = []
+
         n_objects = num_ob_list[i]
-        ivt_frame = ivt_list[i].data
-        dir_frame = ivt_direction_list[i].data
+        ivt_frame = np.asarray(ivt_list[i].data, dtype=float)
         labelled_frame = labelled_object_list[i].data
+
         for j in range(n_objects):
             label_val = j + 1
+
             # skip filtered objects
-            if (label_val in size_filter[i]) or (label_val in landfall_filter[i]):
+            if label_val in size_filter[i]:
                 step_coords_list.append([])
-                step_landfall_ivt_mags.append(0)
-                step_landfall_ivt_dirs.append(0)
-                step_shape_class.append('ambiguous')
+                step_traj_bearing.append(np.nan)
+                step_max_ivt.append(np.nan)
                 continue
+
             blob_mask = (labelled_frame == label_val)
             if not np.any(blob_mask):
                 step_coords_list.append([])
-                step_landfall_ivt_mags.append(0)
-                step_landfall_ivt_dirs.append(0)
-                step_shape_class.append('ambiguous')
+                step_traj_bearing.append(np.nan)
+                step_max_ivt.append(np.nan)
                 continue
-            blob_ivt = np.where(blob_mask, ivt_frame, 0)
-            max_ivt = blob_ivt.max()
+
+            blob_ivt = np.where(blob_mask, ivt_frame, np.nan)
+            max_ivt = np.nanmax(blob_ivt)
+            step_max_ivt.append(float(max_ivt))
+
             strong_mask = blob_mask & (blob_ivt > 0.7 * max_ivt)
-            # Classify blob shape
-            shape_class = classify_blob_shape(blob_mask, strong_mask)
-            step_shape_class.append(shape_class)
+
             # Skeletonize to get axis
-            skel = skeletonize(strong_mask.astype(np.uint8))
+            skel = skeletonize(strong_mask.astype(np.uint8)).astype(bool)
             axis_data[skel] = label_val
             coords = np.argwhere(skel)
             step_coords_list.append([(np.array([r]), np.array([c])) for r, c in coords])
-            # Landfall location (max IVT cell)
-            r, c = np.unravel_index(np.argmax(blob_ivt), blob_ivt.shape)
-            landfall_data[r, c] = label_val
-            step_landfall_ivt_mags.append(ivt_frame[r, c])
-            step_landfall_ivt_dirs.append(dir_frame[r, c])
-        axis_cube = zero.copy(data=axis_data)
-        landfall_cube = zero.copy(data=landfall_data)
-        axis_list.append(axis_cube)
+
+            # trajectory bearing from farthest skeleton endpoints
+            ep1, ep2 = skeleton_endpoints_farthest(skel)
+            if (ep1 is not None) and (ep2 is not None):
+                r1, c1 = ep1
+                r2, c2 = ep2
+                step_traj_bearing.append(
+                    float(bearing_deg(float(lats[r1]), float(lons[c1]), float(lats[r2]), float(lons[c2])))
+                )
+            else:
+                step_traj_bearing.append(np.nan)
+
+        axis_list.append(zero.copy(data=axis_data))
         axis_coords_list.append(step_coords_list)
-        landfall_locations.append(landfall_cube)
-        landfall_ivt_magnitudes.append(step_landfall_ivt_mags)
-        landfall_ivt_directions.append(step_landfall_ivt_dirs)
-        shape_classification_list.append(step_shape_class)
-    return (axis_list, axis_coords_list, landfall_locations, landfall_ivt_magnitudes, landfall_ivt_directions, shape_classification_list)
-                
+        traj_bearing_list.append(step_traj_bearing)
+        max_ivt_list.append(step_max_ivt)
+
+    return (axis_list, axis_coords_list, traj_bearing_list, max_ivt_list)
+
+def _to_0_360(lon):
+    a = np.asarray(lon, float)
+    return ((a + 360.) % 360.)
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Forward azimuth (degrees clockwise from North) from (lat1,lon1) to (lat2,lon2)."""
+    phi1 = np.deg2rad(lat1)
+    phi2 = np.deg2rad(lat2)
+    lam1 = np.deg2rad(lon1)
+    lam2 = np.deg2rad(lon2)
+    dlam = lam2 - lam1
+    x = np.sin(dlam) * np.cos(phi2)
+    y = np.cos(phi1) * np.sin(phi2) - np.sin(phi1) * np.cos(phi2) * np.cos(dlam)
+    theta = np.arctan2(x, y)
+    return (np.rad2deg(theta) + 360) % 360
+
+def skeleton_endpoints_farthest(skel_mask):
+    """Return two (row,col) endpoints as the farthest pair of skeleton pixels."""
+    coords = np.column_stack(np.nonzero(skel_mask))
+    if coords.shape[0] < 2:
+        return None, None
+    diffs = coords[:, None, :] - coords[None, :, :]
+    d2 = np.sum(diffs * diffs, axis=2)
+    i1, i2 = np.unravel_index(np.argmax(d2), d2.shape)
+    return tuple(coords[i1]), tuple(coords[i2])
+
 ### DETECTION ALGORITHM
 
 for year in years:
@@ -465,125 +478,174 @@ for year in years:
         # assign cubes to IVT variables
         northward_ivt = n_ivt_cubes[0]
         eastward_ivt = e_ivt_cubes[0]
+        lat_points = northward_ivt.coord("latitude").points
+        lon_points = northward_ivt.coord("longitude").points
+
+        # Helper to convert (row,col) to (lat,lon) using this month's cube coordinates
+        def rc_to_latlon(rc):
+            r = int(rc[0][0])
+            c = int(rc[1][0])
+            return float(lat_points[r]), float(lon_points[c])
+        
         if use_filter_longitude:
             lon_points = northward_ivt.coord('longitude').points
-            mask_lon = lon_points < 160
+            mask_lon = lon_points < 110
             northward_ivt.data[:, :, mask_lon] = np.nan
             eastward_ivt.data[:, :, mask_lon] = np.nan
         # compute magnitude
         ivt_mag = np.sqrt(northward_ivt.data**2 + eastward_ivt.data**2)
         ivt = northward_ivt.copy(data=ivt_mag)
-        zero = 0 * ivt[0]
         # compute direction
         ivt_dir = ivt.copy()
         ivt_dir.data = ((np.arctan2(eastward_ivt.data, northward_ivt.data) 
                                * 180 / np.pi) + 180) % 360
         
-        ## SORT DATA
+       ## SORT / AGGREGATE DATA
 
         ivt_list = []
         northward_ivt_list = []
         eastward_ivt_list = []
         ivt_direction_list = []
-        for i in range(ivt.shape[0]):
-            ivt_list.append(ivt[i])
-            northward_ivt_list.append(northward_ivt[i])
-            eastward_ivt_list.append(eastward_ivt[i])
-            ivt_direction_list.append(ivt_dir[i])
+
+        time_coord_full = ivt.coord('time')
+        time_datetimes = time_coord_full.units.num2date(time_coord_full.points)
+
+        if aggregate_daily:
+            # group timestep indices by UTC date
+            by_date = {}
+            for ti, dt in enumerate(time_datetimes):
+                dkey = dt.strftime('%Y-%m-%d')
+                by_date.setdefault(dkey, []).append(ti)
+
+            # build daily cubes
+            for dkey in sorted(by_date.keys()):
+                idxs = by_date[dkey]
+                mag_stack = ivt.data[idxs, :, :].astype(float)
+                if daily_method.lower() == 'sum':
+                    mag_daily = np.nansum(mag_stack, axis=0)
+                else:
+                    mag_daily = np.nanmean(mag_stack, axis=0)
+
+                # daily mean components (direction diagnostics)
+                n_stack = northward_ivt.data[idxs, :, :].astype(float)
+                e_stack = eastward_ivt.data[idxs, :, :].astype(float)
+                n_daily = np.nanmean(n_stack, axis=0)
+                e_daily = np.nanmean(e_stack, axis=0)
+
+                dir_daily = ((np.arctan2(e_daily, n_daily) * 180 / np.pi) + 180) % 360
+
+                # create 2D cubes with a single time point (use first index's time)
+                t0 = idxs[0]
+                ivt_day = ivt[t0].copy(data=mag_daily)
+                n_day = northward_ivt[t0].copy(data=n_daily)
+                e_day = eastward_ivt[t0].copy(data=e_daily)
+                dir_day = ivt_dir[t0].copy(data=dir_daily)
+
+                ivt_list.append(ivt_day)
+                northward_ivt_list.append(n_day)
+                eastward_ivt_list.append(e_day)
+                ivt_direction_list.append(dir_day)
+
+            print(f'Aggregated to {len(ivt_list)} daily fields for {year}-{month:02d} using method={daily_method}')
+        else:
+            # Use all 6-hourly timesteps directly
+            n_timesteps = ivt.shape[0]  # ✅ define before using
+            for i in range(n_timesteps):
+                ivt_list.append(ivt[i])
+                northward_ivt_list.append(northward_ivt[i])
+                eastward_ivt_list.append(eastward_ivt[i])
+                ivt_direction_list.append(ivt_dir[i])
+            print(f'Using {len(ivt_list)} 6-hourly timesteps for {year}-{month:02d}')
+
+        # number of frames used downstream
+        n_frames = len(ivt_list)
+        zero = ivt_list[0].copy(data=np.zeros_like(ivt_list[0].data))
 
         ## COMPUTE IVT THRESHOLDs
 
         print('Loading Monthly IVT Climatology Thresholds')
-        clim_file = '/n/home10/ahatzius/AR_tracker/kennett_2021/MERRA/ivt_climatology_monthly.nc'
-        ivt_clim = iris.load_cube(clim_file)
+        clim_file = '/n/home10/ahatzius/AR_tracker/kennett_2021/SPCAM/ivt_climatology_monthly.nc'
+        ivt_clim_ds = xr.open_dataset(clim_file)
 
         # select the current month slice from climatology
         month_index = month  # assuming 1–12 indexing
-        ivt_threshold = ivt_clim.extract(iris.Constraint(month=month_index))
+        ivt_threshold_xr = ivt_clim_ds['IVT_climatology'].sel(month=month_index)
+        thr2d = np.asarray(ivt_threshold_xr.values, dtype=float)
 
         print(f'Using climatological IVT threshold for month {month_index}')
+        print(f'  Shape: {thr2d.shape}, Range: [{np.nanmin(thr2d):.1f}, {np.nanmax(thr2d):.1f}] kg/m/s')
+
+        # subtract climatology to work entirely with IVT anomalies
+        anomaly_ivt_list = []
+        for cube in ivt_list:
+            anomaly_ivt_list.append(cube.copy(data=np.asarray(cube.data, dtype=float) - thr2d))
+        ivt_list = anomaly_ivt_list
         
         ## IDENTIFY OBJECTS
 
         print('Identifying Objects')
 
-        object_mask = ivt.copy()
-        object_mask.data = (ivt.data > ivt_threshold.data).astype(int)
-
-        # create a second mask isolating only top 5% of IVT within the day
-        ivt_array = np.array(ivt.data, dtype=float, copy=True, order='C')
-        ivt_95th = np.percentile(ivt_array, 95)
-        max_mask = ivt.copy()
-        max_mask.data = (ivt.data >= ivt_95th).astype(int)
-
-        # overlap max_mask with object_mask to refine candidate regions to keep only objects that intersect strong IVT cores
-        refined_mask = ivt.copy()
-        refined_mask.data = np.logical_and(object_mask.data, max_mask.data).astype(int)
-        object_mask.data = refined_mask.data
-
-        # label connected objects per timestep (8-connected)
-        structure = np.ones((3, 3), dtype=int)
-        labelled = np.empty_like(object_mask.data, dtype=int)
-
         labelled_object_list = []
         num_ob_list = []
         object_mask_list = []
-        for i in range(ivt.shape[0]):
-            object_mask_list.append(object_mask[i])
 
-        for t in range(object_mask.shape[0]):
-            labels, num = ndimage.label(object_mask.data[t], structure=structure)
-            labelled[t] = labels
-
-            label_cube = object_mask[t].copy(data=labels)
-            labelled_object_list.append(label_cube)
-            num_ob_list.append(num)
+        # Loop over frames in ivt_list (daily 2D cubes or 6-hourly 2D cubes)
+        for i in range(len(ivt_list)):
+            frame = ivt_list[i]
+            
+            # 1) Positive-anomaly mask
+            M = (np.asarray(frame.data, dtype=float) > 0).astype(int)
+            
+            # 2) Strong-core mask (within-frame 95th percentile)
+            ivt_array = np.array(frame.data, dtype=float, copy=True, order='C')
+            ivt_95th = np.nanpercentile(ivt_array, 95)
+            M95 = (np.asarray(frame.data, dtype=float) >= ivt_95th).astype(int)
+            
+            # 3) INTERSECTION: only keep pixels that are BOTH >0 AND ≥P95
+            M_final = np.logical_and(M, M95).astype(int)
+            
+            # 4) Label connected components
+            structure = np.ones((3, 3), dtype=int)
+            labels, num = ndimage.label(M_final, structure=structure)
+            
+            # Store results
+            mask_cube = frame.copy()
+            mask_cube.data = M_final
+            object_mask_list.append(mask_cube)
+            
+            labelled_object_list.append(frame.copy(data=labels))
+            num_ob_list.append(int(num))
 
         ## PRELIMINARY CHECKS
 
-        # landfall check; if enabled
-        landfall_filter = [[] for _ in range(ivt.shape[0])]
-        if use_filter_landfall:
-            print('Landfall Criterion')
-            for i in range(ivt.shape[0]):
-                Filter = []
-                Array = land_mask_data * labelled_object_list[i].data
-                for j in range(num_ob_list[i]):
-                    landfall_check = (j+1) in Array
-                    if landfall_check == False:
-                        Filter.append(j+1)
-                landfall_filter[i] = Filter
-
         # size filter to speed up runtime
-        size_filter = [[] for _ in range(ivt.shape[0])]
+        size_filter = [[] for _ in range(len(ivt_list))]
         if use_filter_size:
             print('Size Criterion')
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 # Calculate sizes
                 object_sizes = ndimage.sum(object_mask_list[i].data, 
                                            labelled_object_list[i].data, 
                                            list(range(1, num_ob_list[i]+1)))
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]):
-                        if object_sizes[j] > min_size:
-                            size_check = True
-                        else:
-                            size_check = False
-                        if size_check == False:
-                            Filter.append(j+1)
+                    if object_sizes[j] > min_size:
+                        size_check = True
+                    else:
+                        size_check = False
+                    if size_check == False:
+                        Filter.append(j+1)
                 size_filter[i] = Filter
 
         # latitude filter: filter out objects where less than 85% of the blob is between 20° and 55° latitude
-        lat_filter = [[] for _ in range(ivt.shape[0])]
+        lat_filter = [[] for _ in range(len(ivt_list))]
         print('Latitude Criterion')
         if use_filter_latitude:
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 latitudes = northward_ivt.coord('latitude').points
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i] and
-                        (j+1) not in size_filter[i]):
+                    if ((j+1) not in size_filter[i]):
                         # Get indices of blob cells
                         blob_mask = (labelled_object_list[i].data == (j+1))
                         # Count total blob cells
@@ -591,45 +653,65 @@ for year in years:
                         # Get corresponding latitudes of each blob cell
                         lat_indices = np.where(blob_mask)
                         blob_lats = latitudes[lat_indices[0]]
-                        # Count cells within [20, 55] degrees
-                        valid_cells = np.sum((blob_lats >= 20) & (blob_lats <= 55))
+                        # Count cells within [15, 65] degrees
+                        valid_cells = np.sum((blob_lats >= 15) & (blob_lats <= 65))
                         if valid_cells / total_cells < 0.8:
                             Filter.append(j+1)
                 lat_filter[i] = Filter
+
+        # longitude filter: remove blobs with >=50% of cells between 110E and 150E
+        lon_filter = [[] for _ in range(len(ivt_list))]
+        if use_filter_longitude:
+            print('Longitude Criterion')
+            lon_points = northward_ivt.coord('longitude').points
+            for i in range(n_frames):
+                Filter = []
+                for j in range(num_ob_list[i]):
+                    if ((j+1) not in size_filter[i]):
+                        blob_mask = (labelled_object_list[i].data == (j+1))
+                        total_cells = np.sum(blob_mask)
+                        if total_cells == 0:
+                            continue
+                        lon_indices = np.where(blob_mask)
+                        blob_lons = lon_points[lon_indices[1]]
+                        frac = np.sum((blob_lons >= 110) & (blob_lons <= 140)) / total_cells
+                        if frac >= 0.5:
+                            Filter.append(j+1)
+                lon_filter[i] = Filter
+        else:
+            lon_filter = [[] for _ in range(len(ivt_list))]
         
         ## COMPUTE AXIS
 
         print('Computing AR Axes')
-        (axis_list, axis_coords_list, landfall_locations, landfall_ivt_magnitudes,
-         landfall_ivt_directions, shape_classification_list) = compute_ar_axes(
+        (axis_list, axis_coords_list,
+        traj_bearing_list, max_ivt_list) = compute_ar_axes(
             ivt, zero, labelled_object_list, ivt_list, ivt_direction_list,
-            num_ob_list, size_filter, landfall_filter)
+            num_ob_list, size_filter,
+            northward_ivt_list, eastward_ivt_list)
         
         ## COMPUTE AXIS LENGTH
         axis_length_list = []
-        def calc_length(axis_coords):
-            length = 0
-            for k in list(range(len(axis_coords)-1)):
-                lat1=max_lat-(res*np.abs(axis_coords[k][0]))
-                lon1=min_lon+(res*np.abs(axis_coords[k][1]))
-                lat2=max_lat-(res*np.abs(axis_coords[k+1][0]))
-                lon2=min_lon+(res*np.abs(axis_coords[k+1][1]))
-                coords_1 = (lat1, lon1)
-                coords_2 = (lat2, lon2)
-                segment = geopy.distance.distance(coords_1, coords_2).km
-                length += segment
-            return length
-        for i in range(ivt.shape[0]):
-            # Compute length of each Object
-            step_length_list = []
+        for i in range(n_frames):
+            step_lengths = []
             for j in range(num_ob_list[i]):
-                if (((j+1) not in size_filter[i]) 
-                    & ((j+1) not in landfall_filter[i])):
-                    length = calc_length(axis_coords_list[i][j])
-                    step_length_list.append(length)
-                else:
-                    step_length_list.append(0)
-            axis_length_list.append(step_length_list) 
+                if (j+1) in size_filter[i] or (j+1) in lon_filter[i]:
+                    step_lengths.append(0.0)
+                    continue
+                
+                axis_coords = axis_coords_list[i][j]
+                if len(axis_coords) < 2:
+                    step_lengths.append(0.0)
+                    continue
+                
+                length = 0.0
+                for k in range(len(axis_coords) - 1):
+                    lat1, lon1 = rc_to_latlon(axis_coords[k])
+                    lat2, lon2 = rc_to_latlon(axis_coords[k+1])
+                    length += geopy.distance.distance((lat1, lon1), (lat2, lon2)).km
+                step_lengths.append(float(length))
+            
+            axis_length_list.append(step_lengths)
 
         ## CALCULATE SURFACE AREAS
 
@@ -642,7 +724,7 @@ for year in years:
         grid_areas.data = (iris.analysis.cartography.area_weights(grid_areas) 
                           / (1000**2))
         # Compute surface area of Objects
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             areas = ndimage.sum(grid_areas.data, 
                                    labelled_object_list[i].data, 
                                    list(range(1, num_ob_list[i]+1)))
@@ -653,7 +735,7 @@ for year in years:
         # The Width of an Object is calculated as its surface area divided
         # by its length.
         object_width_list = []
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             widths = []
             for j in range(num_ob_list[i]):
                 if (axis_length_list[i][j] > 0):
@@ -666,28 +748,28 @@ for year in years:
         
         ### AR CRITERIA ###
         ## LENGTH ##
-        filter_list_1 = [[] for _ in range(ivt.shape[0])]
+        filter_list_1 = [[] for _ in range(n_frames)]
         if use_filter_length:
             print('Length Criterion')
             # Filter Objects based on axis length.
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]) and ((j+1) not in size_filter[i]) and ((j+1) not in lat_filter[i]):
+                    if ((j+1) not in size_filter[i]) and ((j+1) not in lat_filter[i]) and ((j+1) not in lon_filter[i]):
                         length_check = (axis_length_list[i][j] > min_length)
                         if length_check == False:
                             Filter.append(j+1)
                 filter_list_1[i] = Filter
         
         ## NARROWNESS ##
-        filter_list_2 = [[] for _ in range(ivt.shape[0])]
+        filter_list_2 = [[] for _ in range(n_frames)]
         if use_filter_narrowness:
             print('Narrowness Criterion')
             # Filter Objects based on length/width ratio.
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]) and ((j+1) not in size_filter[i]) and ((j+1) not in lat_filter[i]) and ((j+1) not in filter_list_1[i]):
+                    if ((j+1) not in size_filter[i]) and ((j+1) not in lat_filter[i]) and ((j+1) not in lon_filter[i]) and ((j+1) not in filter_list_1[i]):
                         narrowness_check = ((axis_length_list[i][j] 
                                             / object_width_list[i][j]) > min_aspect)
                         if narrowness_check == False:
@@ -696,7 +778,7 @@ for year in years:
 
         ## MAX IVT COORDS
         max_IVT_coords_list = []
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             NewList = []
             for j in range(num_ob_list[i]):
                 if (len(axis_coords_list[i][j]) > 0):
@@ -708,7 +790,7 @@ for year in years:
 
         ## MEANT IVT MAG
         mean_ivt_magnitude_list = []
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             NewList = ndimage.mean(ivt_list[i].data, 
                                    labelled_object_list[i].data, 
                                    list(range(1, num_ob_list[i]+1)))
@@ -716,70 +798,68 @@ for year in years:
 
         ## MEAN IVT DIR
         mean_ivt_direction_list = []
-        for i in range(ivt.shape[0]):
-            mean_northward_ivt = ndimage.mean(northward_ivt[i].data, 
-                                              labelled_object_list[i].data, 
-                                              list(range(1, num_ob_list[i]+1)))
-            mean_eastward_ivt = ndimage.mean(eastward_ivt[i].data, 
-                                             labelled_object_list[i].data, 
-                                             list(range(1, num_ob_list[i]+1)))
+        for i in range(n_frames):
+            mean_northward_ivt = ndimage.mean(northward_ivt_list[i].data,
+                                  labelled_object_list[i].data,
+                                  list(range(1, num_ob_list[i]+1)))
+            mean_eastward_ivt = ndimage.mean(eastward_ivt_list[i].data,
+                                            labelled_object_list[i].data,
+                                            list(range(1, num_ob_list[i]+1)))
             NewList = ((np.arctan2(mean_eastward_ivt, mean_northward_ivt) 
                         * 180 / np.pi) + 180) % 360
             mean_ivt_direction_list.append(NewList)
 
         ## OBJECT ORIENTATION
         object_orientation_list = []
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             NewList = []
             for j in range(num_ob_list[i]):
-                if (len(axis_coords_list[i][j]) > 0):
-                    coords_A = axis_coords_list[i][j][0]
-                    coords_B = axis_coords_list[i][j][-1]
-                else:
-                    coords_A = (0,0)
-                    coords_B = (0,0)
-                orientation = ((np.arctan2(coords_A[1] - coords_B[1], 
-                                           coords_A[0] - coords_B[0]) 
-                            * 180 / np.pi) + 180) % 360
-                NewList.append(orientation)
+                if len(axis_coords_list[i][j]) < 2:
+                    NewList.append(np.nan)
+                    continue
+                
+                coords_A = axis_coords_list[i][j][0]
+                coords_B = axis_coords_list[i][j][-1]
+                lat1, lon1 = rc_to_latlon(coords_A)
+                lat2, lon2 = rc_to_latlon(coords_B)
+                
+                # bearing from A to B (toward), then convert to "from" convention
+                bearing_toward = bearing_deg(lat1, lon1, lat2, lon2)
+                orientation_from = (bearing_toward + 180.0) % 360.0
+                NewList.append(float(orientation_from))
             object_orientation_list.append(NewList)
 
         ## AXIS DISTANCE (direct b/w start and end)
         axis_distance_list = []
-        for i in range(ivt.shape[0]):
+        for i in range(n_frames):
             NewList = []
             for j in range(num_ob_list[i]):
-                if (len(axis_coords_list[i][j]) > 0):
-                    coords_A = axis_coords_list[i][j][0]
-                    coords_B = axis_coords_list[i][j][-1]
-                else:
-                    coords_A = (0,0)
-                    coords_B = (0,0)
-                # BEGIN PATCH: clip latitudes to valid range for axis distance calc
-                lat1 = np.clip(max_lat - (res * np.abs(coords_A[0])), -90, 90)
-                lon1 = min_lon + (res * np.abs(coords_A[1]))
-                lat2 = np.clip(max_lat - (res * np.abs(coords_B[0])), -90, 90)
-                lon2 = min_lon + (res * np.abs(coords_B[1]))
-                # END PATCH
-                coords_1 = (lat1, lon1)
-                coords_2 = (lat2, lon2)
-                axis_distance = geopy.distance.distance(coords_1, coords_2).km
-                NewList.append(axis_distance)
+                if len(axis_coords_list[i][j]) < 2:
+                    NewList.append(0.0)
+                    continue
+                
+                coords_A = axis_coords_list[i][j][0]
+                coords_B = axis_coords_list[i][j][-1]
+                lat1, lon1 = rc_to_latlon(coords_A)
+                lat2, lon2 = rc_to_latlon(coords_B)
+                
+                axis_distance = geopy.distance.distance((lat1, lon1), (lat2, lon2)).km
+                NewList.append(float(axis_distance))
             axis_distance_list.append(NewList)
         
         ## MEAN MERIDIONAL IVT ##
-        filter_list_3 = [[] for _ in range(ivt.shape[0])]
+        filter_list_3 = [[] for _ in range(n_frames)]
         if use_filter_meridional_ivt:
             print('Meridional IVT Criterion')
             # An object is discarded if the mean IVT does not have a poleward 
             # component > 50 kg m**-1 s**-1.
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]
-                        and ((j+1) not in filter_list_1[i]) 
+                    if (((j+1) not in filter_list_1[i])
                         and ((j+1) not in size_filter[i])
                         and ((j+1) not in lat_filter[i])
+                        and ((j+1) not in lon_filter[i])
                         and ((j+1) not in filter_list_2[i])):
                         mean_poleward_ivt = ndimage.mean(
                             northward_ivt_list[i].data,
@@ -792,17 +872,17 @@ for year in years:
                 filter_list_3[i] = Filter
         
         ## IVT DIRECTION COHERENCE ##
-        filter_list_4 = [[] for _ in range(ivt.shape[0])]
+        filter_list_4 = [[] for _ in range(n_frames)]
         if use_filter_ivt_coherence:
             print('Coherence IVT Direction Criterion')
             # If more than half of the grid cells have IVT deviating more than 45°
             # from the object’s mean IVT, the object is filtered.
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]
-                        and ((j+1) not in size_filter[i])
+                    if (((j+1) not in size_filter[i])
                         and ((j+1) not in lat_filter[i])
+                        and ((j+1) not in lon_filter[i])
                         and ((j+1) not in filter_list_1[i])
                         and ((j+1) not in filter_list_2[i])
                         and ((j+1) not in filter_list_3[i])):
@@ -820,7 +900,7 @@ for year in years:
                 filter_list_4[i] = Filter
             
         ## ORIENTATION-DIRECTION ##
-        filter_list_5 = [[] for _ in range(ivt.shape[0])]
+        filter_list_5 = [[] for _ in range(n_frames)]
         if use_filter_orientation:
             print('Consistent Orientation Criterion')
             # If object orientation deviates from the mean IVT direction by more than 
@@ -828,111 +908,35 @@ for year in years:
             # the angle between the first and last grid cells of the AR axis. Further,
             # the distance between the first and last grid cells of the AR axis must be
             # greater than 1000 km.
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 Filter = []
                 for j in range(num_ob_list[i]):
-                    if ((j+1) not in landfall_filter[i]
-                        and ((j+1) not in size_filter[i])
+                    if (((j+1) not in size_filter[i])
                         and ((j+1) not in lat_filter[i])
+                        and ((j+1) not in lon_filter[i])
                         and ((j+1) not in filter_list_1[i])
                         and ((j+1) not in filter_list_2[i])
                         and ((j+1) not in filter_list_3[i])
                         and ((j+1) not in filter_list_4[i])):
                         mean_direction = mean_ivt_direction_list[i][j]
                         object_orientation = object_orientation_list[i][j]
-                        deviation_from_mean_direction = np.absolute(float(mean_direction)- 
-                                                                    float(object_orientation))
-                        consistent_orientation_check = deviation_from_mean_direction > 45
-                        axis_distance_check = axis_distance_list[i][j] < min_span
-                        if (consistent_orientation_check or axis_distance_check) == False:
+                        dev = np.abs(float(mean_direction) - float(object_orientation))
+                        # handle 360° wrap (e.g. 5° vs 355° should be 10° apart, not 350°)
+                        dev = min(dev, 360.0 - dev)
+
+                        too_misaligned = dev > 45.0
+                        too_short = axis_distance_list[i][j] < min_span
+
+                        if too_misaligned or too_short:
                             Filter.append(j+1)
                 filter_list_5[i] = Filter
 
-        ## ORIGIN / BACKWARD TRAJECTORY FILTER ##
-        filter_list_6 = [[] for _ in range(ivt.shape[0])]
-        if use_filter_origin:
-            print("Origin Direction Criterion (Backwards Trajectory)")
-            # Filters ARs whose backward IVT streamline doesn't reach open ocean or intersects Asia
-            max_back_distance_km = 2000  # maximum distance to trace back
-            step_size_km = 100           # step size (~100 km per step)
-            max_steps = int(max_back_distance_km / step_size_km)
-
-            lats = northward_ivt.coord('latitude').points
-            lons = northward_ivt.coord('longitude').points
-
-            for i in range(ivt.shape[0]):
-                Filter = []
-                for j in range(num_ob_list[i]):
-                    # skip objects already filtered out
-                    if ((j+1) in landfall_filter[i]
-                        or (j+1) in size_filter[i]
-                        or (j+1) in lat_filter[i]
-                        or (j+1) in filter_list_1[i]
-                        or (j+1) in filter_list_2[i]
-                        or (j+1) in filter_list_3[i]
-                        or (j+1) in filter_list_4[i]
-                        or (j+1) in filter_list_5[i]):
-                        continue
-
-                    coords = axis_coords_list[i][j]
-                    if not coords:
-                        Filter.append(j+1)
-                        continue
-
-                    # flatten coords list and find westernmost pixel (handle both scalars and 1-element arrays)
-                    flat_coords = np.array([[np.ravel(r)[0], np.ravel(c)[0]] for (r, c) in coords if len(np.ravel(r)) and len(np.ravel(c))])
-                    western_idx = np.argmin(flat_coords[:, 1])
-                    r = int(flat_coords[western_idx, 0])
-                    c = int(flat_coords[western_idx, 1])
-
-                    # initialize position
-                    lat = lats[r]
-                    lon = lons[c]
-                    success = False
-
-                    for step in range(max_steps):
-                        u = eastward_ivt[i].data[r, c]
-                        v = northward_ivt[i].data[r, c]
-                        mag = np.sqrt(u**2 + v**2)
-                        if mag == 0 or np.isnan(mag):
-                            break
-
-                        # move opposite IVT vector direction
-                        dlat = -(v / mag) * (step_size_km / 111.0)
-                        dlon = -(u / mag) * (step_size_km / (111.0 * np.cos(np.deg2rad(lat))))
-                        lat += dlat
-                        lon += dlon
-
-                        # check domain bounds
-                        if (lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon):
-                            break
-
-                        # Check for intersection with Asian landmass (lat 10–80N, lon 60–150E)
-                        if (10 <= lat <= 80) and (60 <= lon <= 150):
-                            Filter.append(j+1)
-                            success = False
-                            break
-
-                        # find nearest grid indices
-                        r = np.argmin(np.abs(lats - lat))
-                        c = np.argmin(np.abs(lons - lon))
-
-                        # check if ocean cell (assuming 0 = ocean, 1 = land)
-                        if land_mask_data[r, c] == 0:
-                            success = True
-                            break
-
-                    if not success and (j+1) not in Filter:
-                        Filter.append(j+1)
-
-                filter_list_6[i] = Filter
-        
         ### CREATE AR SNAPSHOT ###
 
         # main snapshot loop
         if include_ar_snapshot:
             print('Saving Snapshots')
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 start = time.time()
                 valid_ids = compute_valid_ids(i)
                 if not valid_ids:
@@ -941,34 +945,58 @@ for year in years:
                 else:
                     plot_snapshot(
                         i, ar_dir, num_ob_list,
-                        landfall_filter, size_filter, lat_filter,
+                        size_filter, lat_filter,
                         filter_list_1, filter_list_2, filter_list_3, filter_list_4, filter_list_5,
-                        ivt, zero, labelled_object_list, axis_list, eastward_ivt, northward_ivt,
-                        axis_length_list, object_width_list, mean_ivt_magnitude_list, mean_ivt_direction_list,
-                        landfall_ivt_magnitudes, landfall_ivt_directions)
-                    print(f"  timestep {i+1}/{ivt.shape[0]} completed in {time.time() - start:.2f}s")
+                        ivt_list, zero, labelled_object_list, axis_list, eastward_ivt_list, northward_ivt_list,
+                        axis_length_list, object_width_list, mean_ivt_magnitude_list, mean_ivt_direction_list)
+                    print(f"  timestep {i+1}/{n_frames} completed in {time.time() - start:.2f}s")
 
         ### SAVE OUTPUTS ###
         print('Saving Outputs')
 
         # save .nc masks for valid objects
         if include_ar_nc_masks:
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 valid_ids = compute_valid_ids(i)
                 if valid_ids:
-                    save_nc_masks(i, valid_ids)
+                    save_nc_masks(i, valid_ids, ivt_list)
 
         # save ar characteristics csv
         if include_ar_char_csv:
-            for i in range(ivt.shape[0]):
+            for i in range(n_frames):
                 valid_ids = compute_valid_ids(i)
                 if valid_ids:
-                    save_ar_csv(i, valid_ids)
+                    save_ar_csv(i, valid_ids, ivt_list)
 
         # save monthly filtering summary
         if include_filtering_data:
             save_filter_stats()
 
         # month summary + timing
-        total_month_survivors = sum(len(compute_valid_ids(i)) for i in range(ivt.shape[0]))
+        n_frames = len(ivt_list) if aggregate_daily else ivt.shape[0]
+        total_month_survivors = sum(len(compute_valid_ids(i)) for i in range(n_frames))
+
+        # write daily summary if requested and in daily mode
+        if include_daily_summary_csv and aggregate_daily:
+            for i in range(n_frames):
+                time_coord = ivt_list[i].coord('time')
+                time_point = time_coord.units.num2date(time_coord.points[0])
+                dtext = time_point.strftime('%Y-%m-%d')
+                yy, mm, dd = dtext.split('-')
+                valid_ids = compute_valid_ids(i)
+                if not valid_ids:
+                    n_ar = 0
+                    mu_mean = np.nan
+                    mu_max = np.nan
+                    mu_brg = np.nan
+                else:
+                    js = valid_ids
+                    n_ar = len(js)
+                    brg_vals = [traj_bearing_list[i][j] for j in js if not np.isnan(traj_bearing_list[i][j])]
+                    mu_mean = float(np.nanmean([mean_ivt_magnitude_list[i][j] for j in js]))
+                    mu_max = float(np.nanmean([max_ivt_list[i][j] for j in js]))
+                    mu_brg = float(np.nanmean(brg_vals)) if brg_vals else np.nan
+
+                with open(daily_summary_path, 'a', newline='') as f:
+                    csv.writer(f).writerow([yy, mm, dd, n_ar, mu_mean, mu_max, mu_brg])
         print(f'=== {year}-{month:02d}: {total_month_survivors} ARs passed all filters ===')
